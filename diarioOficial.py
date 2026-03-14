@@ -236,21 +236,22 @@ PESSOAS = {
         'numero_de_editais_com_o_padrao_de_data_no_titulo': 3,
         'numero_de_editais_encontrados_na_pesquisa_do_site': 9,
         'fav_x': 59,
-        'fav_y': 121
+        'fav_y': 121,
+        'edital_referencia': 'EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025',
+        'data_referencia': datetime(2025, 9, 19)
     },
     'Beltrano': {
         'url': 'https://www.in.gov.br/consulta/-/buscar/dou?q=%22BELTRANO+DE+TALS%22&s=todos&exactDate=all&sortType=0',
         'numero_de_editais_com_o_padrao_de_data_no_titulo': 5,
         'numero_de_editais_encontrados_na_pesquisa_do_site': 7,
         'fav_x': 157,
-        'fav_y': 121
+        'fav_y': 121,
+        'edital_referencia': 'EDITAL Nº 5 - FUB, DE 10 DE OUTUBRO DE 2025',
+        'data_referencia': datetime(2025, 10, 10)
     }
 }
 #print(PESSOAS['Thiago']['url'])
 
-
-EDITAL_REFERENCIA = "EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025"
-DATA_REFERENCIA = datetime(2025, 9, 19)
 
 EMAIL_CONFIG = {
     'remetente': 'email@gmail.com',
@@ -378,7 +379,6 @@ def analisar_editais_html(html, nome):
     num_resultados = extrair_numero_resultados(html, nome)
     
     # Procura por títulos de editais no JSON
-    #padrao_titulo = r'"title":"([^"]*EDITAL[^"]*FUB[^"]*)"'
     padrao_titulo = r'"title":"([^"]*DE \d{1,2} DE [A-ZÇÃÕ]+ DE \d{4}[^"]*)"'
     titulos = re.findall(padrao_titulo, html, re.IGNORECASE)
     
@@ -446,14 +446,14 @@ def sendEmail(nome, novidade, erro, detalhes='', screenshot_path=None):
     cfg = EMAIL_CONFIG
     
     if erro == 1:
-        assunto = f"Erro no script FUB 25 do {nome}"
+        assunto = f"Erro no script do {nome}"
         mensagem = f"Ocorreu um erro ao verificar os editais.\n\nDetalhes:\n{detalhes}\n\nAcesse o DOU:\n{PESSOAS[nome]['url']}"
         
     elif novidade == 0:
-        assunto = 'FUB 25 sem novidades'
+        assunto = 'DOU 25 sem novidades'
         mensagem = f"{nome}, continue acreditando!\nDeus é fiel!\n\n{detalhes}\n\nAcesse o DOU:\n{PESSOAS[nome]['url']}"
     elif novidade == 1:
-        assunto = 'ATENÇÃO! NOVIDADE FUB 25! VEJA O DOU!'
+        assunto = 'ATENÇÃO! NOVIDADE DOU! VEJA O DOU!'
         assunto = f'⚠️ {assunto} ⚠️'
         mensagem = f"Novidade para {nome}!\n\n{detalhes}\n\nAcesse o DOU:\n{PESSOAS[nome]['url']}\n\nVerifique o screenshot anexo."
     
@@ -511,7 +511,7 @@ def abrir_navegador_e_capturar(nome, fav_x, fav_y):
     
     # Captura screenshot
     desktop_path = obter_caminho_desktop()
-    pasta_novidades = os.path.join(desktop_path, 'FUB_2025_novidades')
+    pasta_novidades = os.path.join(desktop_path, 'DOU_2025_novidades')
     screenshot_path = capturar_screenshot(pasta_novidades, f'{nome}_')
     
     # Fecha a aba
@@ -532,7 +532,11 @@ def verificar_pessoa(nome, config):
     print("\n" + "="*80)
     print(f"VERIFICANDO EDITAIS PARA: {nome}")
     print("="*80)
-    
+
+    # Referências individuais por pessoa
+    edital_referencia = config['edital_referencia']
+    data_referencia   = config['data_referencia']
+
     # 1. Captura o HTML
     html = capturar_html(config['url'])
     
@@ -555,11 +559,11 @@ def verificar_pessoa(nome, config):
         sendEmail(nome, 0, 1, "Erro ao analisar os editais", screenshot_path)
         return
     
-    total = resultado['total_editais']
-    esperado = config['numero_de_editais_com_o_padrao_de_data_no_titulo']
+    total          = resultado['total_editais']
+    esperado       = config['numero_de_editais_com_o_padrao_de_data_no_titulo']
     num_resultados = resultado['num_resultados']
     numero_de_editais_encontrados_na_pesquisa_do_site = config['numero_de_editais_encontrados_na_pesquisa_do_site']
-    mais_recente = resultado['edital_mais_recente']
+    mais_recente   = resultado['edital_mais_recente']
     
     print(f"\n  Total de editais com data encontrados: {total}")
     print(f"  Total de editais com data esperados: {esperado}")
@@ -585,11 +589,11 @@ def verificar_pessoa(nome, config):
         motivo.append(f"Número de resultados no site mudou: {numero_de_editais_encontrados_na_pesquisa_do_site} → {num_resultados}")
     
     if mais_recente:
-        if mais_recente['data_obj'] > DATA_REFERENCIA:
+        if mais_recente['data_obj'] > data_referencia:
             tem_novidade = True
             motivo.append(f"Novo edital mais recente: {mais_recente['data_obj'].strftime('%d/%m/%Y')}")
             motivo.append(f"Título: {mais_recente['titulo'][:80]}...")
-        elif EDITAL_REFERENCIA not in mais_recente['titulo']:
+        elif edital_referencia not in mais_recente['titulo']:
             tem_novidade = True
             motivo.append("Edital de referência não é o mais recente")
     
@@ -604,7 +608,7 @@ def verificar_pessoa(nome, config):
         
         # Limpa screenshots antigos
         desktop_path = obter_caminho_desktop()
-        pasta_novidades = os.path.join(desktop_path, 'FUB_2025_novidades')
+        pasta_novidades = os.path.join(desktop_path, 'DOU_2025_novidades')
         limpar_screenshots_antigos(pasta_novidades, 20)
         
         # Envia email
@@ -624,8 +628,8 @@ def verificar_pessoa(nome, config):
         detalhes = f"Editais com data: {total}\n"
         if num_resultados is not None:
             detalhes += f"Número de resultados no site: {num_resultados}\n"
-        detalhes += f"Edital mais recente: {EDITAL_REFERENCIA}"
-        sendEmail(nome, 0, 0, detalhes,)
+        detalhes += f"Edital mais recente: {edital_referencia}"
+        sendEmail(nome, 0, 0, detalhes)
 
 # ============================================================================
 # EXECUÇÃO PRINCIPAL
@@ -633,7 +637,7 @@ def verificar_pessoa(nome, config):
 
 if __name__ == "__main__":
     print("\n" + "="*80)
-    print("MONITOR DE EDITAIS DOU - FUB 25")
+    print("MONITOR DE EDITAIS DOU")
     print(f"Data/Hora: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
     print("="*80)
     
