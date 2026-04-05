@@ -220,44 +220,435 @@ import pyautogui
 import time
 import subprocess
 import smtplib
-from email.message import EmailMessage
+import select
+import sys
+import json
 import os
 import glob
+from email.message import EmailMessage
 from datetime import datetime
+from pathlib import Path
 import re
 
 # ============================================================================
-# CONFIGURAÇÕES
+# CAMINHO DO ARQUIVO DE CONFIGURAÇÃO JSON
 # ============================================================================
 
-PESSOAS = {
-    'Fulano': {
-        'url': 'https://www.in.gov.br/consulta/-/buscar/dou?q=%22FULANO+DE+TALS%22&s=todos&exactDate=all&sortType=0',
-        'numero_de_editais_com_o_padrao_de_data_no_titulo': 3,
-        'numero_de_editais_encontrados_na_pesquisa_do_site': 9,
-        'fav_x': 59,
-        'fav_y': 121,
-        'edital_referencia': 'EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025',
-        'data_referencia': datetime(2025, 9, 19)
-    },
-    'Beltrano': {
-        'url': 'https://www.in.gov.br/consulta/-/buscar/dou?q=%22BELTRANO+DE+TALS%22&s=todos&exactDate=all&sortType=0',
-        'numero_de_editais_com_o_padrao_de_data_no_titulo': 5,
-        'numero_de_editais_encontrados_na_pesquisa_do_site': 7,
-        'fav_x': 157,
-        'fav_y': 121,
-        'edital_referencia': 'EDITAL Nº 5 - FUB, DE 10 DE OUTUBRO DE 2025',
-        'data_referencia': datetime(2025, 10, 10)
-    }
-}
-#print(PESSOAS['Thiago']['url'])
+# O arquivo config_editais.json deve estar na mesma pasta que este script.
+# Você pode alterar o caminho abaixo se preferir outra localização.
+CONFIG_PATH = Path(__file__).parent / 'config_editais.json'
+
+# Campos obrigatórios de cada pessoa no JSON
+CAMPOS_PESSOA = [
+    'nome_dou',
+    'numero_de_editais_com_o_padrao_de_data_no_titulo',
+    'numero_de_editais_encontrados_na_pesquisa_do_site',
+    'fav_x',
+    'fav_y',
+    'edital_referencia',
+    'data_referencia',
+    'destinatarios',
+]
+
+# Campos obrigatórios da seção de e-mail no JSON
+CAMPOS_EMAIL = ['remetente', 'senha']
+
+# ============================================================================
+# ASSISTENTE INTERATIVO DE CONFIGURAÇÃO
+# ============================================================================
+
+def _ler(prompt: str, obrigatorio: bool = True) -> str:
+    """Lê uma linha do terminal. Se 'obrigatorio', repete até o usuário digitar algo."""
+    while True:
+        valor = input(prompt).strip()
+        if valor or not obrigatorio:
+            return valor
+        print("  ⚠️  Este campo é obrigatório. Por favor, preencha.")
 
 
-EMAIL_CONFIG = {
-    'remetente': 'email@gmail.com',
-    'destinatario': 'email@gmail.com',
-    'senha': 'xxxx xxxx xxxx xxxx'
-}
+def _ler_inteiro(prompt: str) -> int:
+    """Lê um inteiro do terminal, repetindo até obter um valor válido."""
+    while True:
+        texto = input(prompt).strip()
+        try:
+            return int(texto)
+        except ValueError:
+            print("  ⚠️  Digite apenas números inteiros (ex.: 3).")
+
+
+def _ler_data(prompt: str) -> datetime:
+    """Lê uma data no formato DD/MM/AAAA e devolve um objeto datetime."""
+    while True:
+        texto = input(prompt).strip()
+        for fmt in ('%d/%m/%Y', '%Y-%m-%d'):
+            try:
+                return datetime.strptime(texto, fmt)
+            except ValueError:
+                pass
+        print("  ⚠️  Formato inválido. Use DD/MM/AAAA (ex.: 19/09/2025).")
+
+
+def gerar_url(nome_dou: str) -> str:
+    """
+    Gera a URL de busca no DOU a partir do nome completo para pesquisa.
+    Exemplo: 'FULANO DE TALS' ->
+      https://www.in.gov.br/consulta/-/buscar/dou?q=%22FULANO+DE+TALS%22&s=todos&exactDate=all&sortType=0
+    """
+    from urllib.parse import quote
+    nome_encoded = quote(nome_dou.upper(), safe='')
+    # O DOU usa '+' para espaços dentro das aspas — substituímos %20 por +
+    nome_encoded = nome_encoded.replace('%20', '+')
+    return (
+        f"https://www.in.gov.br/consulta/-/buscar/dou"
+        f"?q=%22{nome_encoded}%22&s=todos&exactDate=all&sortType=0"
+    )
+
+
+def _perguntar_email(dados: dict) -> None:
+    """Pede as credenciais de e-mail ao usuário e preenche dados['email']."""
+    sep = "-" * 60
+    print(f"\n{sep}")
+    print("  CONFIGURAÇÃO DE E-MAIL")
+    print(sep)
+    print("  Informe os dados da conta Gmail que enviará os alertas.")
+    print("  A senha deve ser uma 'Senha de App' do Google (16 caracteres).")
+    print(sep)
+
+    email = dados.setdefault('email', {})
+    if not email.get('remetente'):
+        email['remetente'] = _ler("  E-mail remetente : ")
+    if not email.get('senha'):
+        email['senha']     = _ler("  Senha de App     : ")
+
+
+def _busca_preliminar(nome_dou: str, url: str) -> dict | None:
+    """
+    Faz uma busca no DOU e retorna os dados encontrados para uso na
+    configuração inicial: total de editais, número de resultados,
+    edital mais recente e sua data.
+    Retorna None se a busca falhar.
+    """
+    print(f"\n  🔍 Realizando busca preliminar no DOU para: {nome_dou}")
+    print(f"     URL: {url}")
+    html = capturar_html(url, max_tentativas=5)
+    if not html:
+        return None
+    return analisar_editais_html(html, nome_dou)
+
+
+def _perguntar_pessoa(nome: str, cfg: dict) -> None:
+    """
+    Preenche interativamente os campos ausentes/inválidos de uma pessoa.
+    Pede apenas nome no DOU e coordenadas do favorito; os demais campos
+    são obtidos automaticamente via busca preliminar no site do DOU.
+    Modifica 'cfg' in-place.
+    """
+    sep = "-" * 60
+    print(f"\n{sep}")
+    print(f"  CONFIGURAÇÃO DA PESSOA: {nome}")
+    print(sep)
+
+    # ── Nome para pesquisa no DOU ─────────────────────────────────────────────
+    if not cfg.get('nome_dou'):
+        print("  Nome completo para pesquisa no DOU.")
+        print("  Informe exatamente como aparece nos editais.")
+        print("  Será convertido para maiúsculas automaticamente.")
+        print("  Exemplo: FULANO DE TALS")
+        cfg['nome_dou'] = _ler("  Nome no DOU: ").upper()
+    else:
+        cfg['nome_dou'] = cfg['nome_dou'].upper()
+    cfg['url'] = gerar_url(cfg['nome_dou'])
+    print(f"  ✓ URL gerada: {cfg['url']}")
+
+    # ── Coordenadas do favorito no navegador ──────────────────────────────────
+    if cfg.get('fav_x') is None:
+        print("\n  Posição X (horizontal) do favorito no navegador (pixels):")
+        cfg['fav_x'] = _ler_inteiro("  fav_x: ")
+    if cfg.get('fav_y') is None:
+        print("\n  Posição Y (vertical) do favorito no navegador (pixels):")
+        cfg['fav_y'] = _ler_inteiro("  fav_y: ")
+
+    # ── Destinatários do e-mail para esta pessoa ─────────────────────────────
+    if not cfg.get('destinatarios'):
+        print("\n  E-mails destinatários para alertas desta pessoa.")
+        print("  Digite um endereço por linha. Linha vazia encerra.")
+        lista = []
+        while True:
+            addr = input(f"  Destinatário {len(lista)+1}: ").strip()
+            if not addr:
+                if not lista:
+                    print("  ⚠️  Informe ao menos um destinatário.")
+                    continue
+                break
+            lista.append(addr)
+            print(f"  ✓ {addr} adicionado.")
+        cfg['destinatarios'] = lista
+
+    # ── Busca preliminar para preencher os demais campos automaticamente ──────
+    chave_editais    = 'numero_de_editais_com_o_padrao_de_data_no_titulo'
+    chave_resultados = 'numero_de_editais_encontrados_na_pesquisa_do_site'
+
+    campos_auto_faltando = (
+        cfg.get(chave_editais)    is None or
+        cfg.get(chave_resultados) is None or
+        not cfg.get('edital_referencia') or
+        not cfg.get('data_referencia')
+    )
+
+    if campos_auto_faltando:
+        resultado = _busca_preliminar(cfg['nome_dou'], cfg['url'])
+
+        if resultado:
+            sep2 = "-" * 60
+            print(f"\n{sep2}")
+            print("  RESULTADO DA BUSCA PRELIMINAR")
+            print(sep2)
+
+            total        = resultado['total_editais']
+            num_res      = resultado['num_resultados']
+            mais_recente = resultado['edital_mais_recente']
+
+            print(f"  Editais com padrão de data no título : {total}")
+            if num_res is not None:
+                print(f"  Total de resultados no site          : {num_res}")
+            if mais_recente:
+                print(f"  Edital mais recente encontrado       : {mais_recente['titulo']}")
+                print(f"  Data do edital mais recente          : {mais_recente['data_obj'].strftime('%d/%m/%Y')}")
+            print(sep2)
+
+            # Confirma ou corrige cada valor encontrado
+            print("\n  Confirme os valores encontrados (Enter = aceitar, ou digite para corrigir):")
+
+            if cfg.get(chave_editais) is None:
+                resp = input(f"  Editais com data [{total}]: ").strip()
+                cfg[chave_editais] = int(resp) if resp else total
+
+            if cfg.get(chave_resultados) is None:
+                if num_res is not None:
+                    resp = input(f"  Total de resultados no site [{num_res}]: ").strip()
+                    cfg[chave_resultados] = int(resp) if resp else num_res
+                else:
+                    print("  ⚠️  Não foi possível detectar o total de resultados.")
+                    cfg[chave_resultados] = _ler_inteiro("  Digite manualmente: ")
+
+            if not cfg.get('edital_referencia'):
+                if mais_recente:
+                    resp = input(f"  Edital de referência [{mais_recente['titulo'][:60]}]: ").strip()
+                    cfg['edital_referencia'] = resp if resp else mais_recente['titulo']
+                else:
+                    print("  ⚠️  Não foi possível detectar o edital mais recente.")
+                    print("  Título do edital mais recente conhecido. Exemplo: EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025")
+                    cfg['edital_referencia'] = _ler("  Título: ")
+
+            if not cfg.get('data_referencia'):
+                if mais_recente:
+                    data_str = mais_recente['data_obj'].strftime('%d/%m/%Y')
+                    resp = input(f"  Data de referência [{data_str}]: ").strip()
+                    if not resp:
+                        cfg['data_referencia'] = mais_recente['data_obj']
+                    else:
+                        # Tenta converter o que o usuário já digitou;
+                        # se o formato for inválido, _ler_data pede novamente
+                        data_convertida = None
+                        for fmt in ('%d/%m/%Y', '%Y-%m-%d'):
+                            try:
+                                data_convertida = datetime.strptime(resp, fmt)
+                                break
+                            except ValueError:
+                                pass
+                        if data_convertida:
+                            cfg['data_referencia'] = data_convertida
+                        else:
+                            print("  ⚠️  Formato inválido. Use DD/MM/AAAA (ex.: 19/09/2025).")
+                            cfg['data_referencia'] = _ler_data("  Data de referência (DD/MM/AAAA): ")
+                else:
+                    print("  ⚠️  Não foi possível detectar a data do edital mais recente.")
+                    cfg['data_referencia'] = _ler_data("  Data de referência (DD/MM/AAAA): ")
+
+        else:
+            # Busca falhou — pede manualmente como fallback
+            print("  ⚠️  Busca preliminar falhou. Preencha os campos manualmente.")
+
+            if cfg.get(chave_editais) is None:
+                print("\n  Quantos editais com padrão de data no título existem na busca?")
+                print("  (Títulos no formato: '... DE DD DE MÊS DE AAAA')")
+                cfg[chave_editais] = _ler_inteiro("  Número: ")
+
+            if cfg.get(chave_resultados) is None:
+                print("\n  Quantos resultados totais o site exibe para essa busca?")
+                cfg[chave_resultados] = _ler_inteiro("  Número: ")
+
+            if not cfg.get('edital_referencia'):
+                print("\n  Título do edital mais recente conhecido.")
+                print("  Exemplo: EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025")
+                cfg['edital_referencia'] = _ler("  Título: ")
+
+            if not cfg.get('data_referencia'):
+                print("\n  Data do edital de referência (DD/MM/AAAA):")
+                cfg['data_referencia'] = _ler_data("  Data: ")
+
+
+def _assistente_configuracao(dados: dict) -> dict:
+    """
+    Verifica todos os campos obrigatórios do dicionário 'dados'.
+    Para cada campo ausente ou inválido, pergunta ao usuário no terminal.
+    Ao final, retorna o dicionário completo e atualizado.
+    """
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print("  ASSISTENTE DE CONFIGURAÇÃO — MONITOR DE EDITAIS DOU")
+    print(f"{sep}")
+    print("  Alguns dados estão ausentes. Por favor, preencha abaixo.")
+    print("  As informações serão salvas em config_editais.json")
+    print(f"{sep}")
+
+    # ── Seção e-mail ─────────────────────────────────────────────────────────
+    email_incompleto = any(
+        not dados.get('email', {}).get(c) for c in CAMPOS_EMAIL
+    )
+    if email_incompleto:
+        _perguntar_email(dados)
+
+    # ── Seção pessoas ─────────────────────────────────────────────────────────
+    if not dados.get('pessoas'):
+        # Nenhuma pessoa cadastrada: pede ao menos uma
+        print("\n  Nenhuma pessoa cadastrada. Vamos adicionar a primeira.")
+        print("  Informe o nome exatamente como aparece nos editais do DOU.")
+        print("  Use letras maiúsculas. Exemplo: FULANO DE TALS")
+        nome_dou_inicial = _ler("\n  Nome no DOU: ").upper()
+        dados['pessoas'] = {nome_dou_inicial: {'nome_dou': nome_dou_inicial}}
+
+    # Percorre pessoas existentes e completa campos faltantes
+    for nome, cfg in dados['pessoas'].items():
+        campos_faltando = [
+            c for c in CAMPOS_PESSOA
+            if cfg.get(c) is None or cfg.get(c) == ''
+        ]
+        if campos_faltando:
+            print(f"\n  ⚠️  Campos ausentes para '{nome}': {', '.join(campos_faltando)}")
+            _perguntar_pessoa(nome, cfg)
+
+    # Verifica se o usuário quer adicionar mais pessoas
+    while True:
+        print("\n" + "-" * 60)
+        resp = input("  Deseja adicionar outra pessoa para monitorar? [s/N] → ").strip().lower()
+        if resp not in ('s', 'sim', 'y', 'yes'):
+            break
+        print("  Informe o nome exatamente como aparece nos editais do DOU.")
+        print("  Use letras maiúsculas. Exemplo: FULANO DE TALS")
+        novo_nome = _ler("  Nome no DOU: ").upper()
+        if novo_nome in dados['pessoas']:
+            print(f"  ⚠️  '{novo_nome}' já está cadastrado.")
+        else:
+            dados['pessoas'][novo_nome] = {'nome_dou': novo_nome}
+            _perguntar_pessoa(novo_nome, dados['pessoas'][novo_nome])
+
+    return dados
+
+# ============================================================================
+# CARREGAMENTO DA CONFIGURAÇÃO
+# ============================================================================
+
+def carregar_configuracao(caminho: Path) -> dict:
+    """
+    Tenta ler o arquivo JSON de configuração.
+    - Se não existir ou estiver vazio: cria uma estrutura base vazia.
+    - Se tiver JSON inválido: avisa e parte de uma estrutura vazia.
+    - Chama o assistente interativo para preencher qualquer campo faltante.
+    - Ao final, salva e devolve o dicionário completo com datas como datetime.
+    """
+    dados: dict = {'email': {}, 'pessoas': {}}
+    assistente_necessario = False
+
+    # ── Tenta ler o arquivo ───────────────────────────────────────────────────
+    if not caminho.exists():
+        print(f"\n  Arquivo de configuração não encontrado: {caminho.name}")
+        print(    "  Um novo arquivo será criado após o preenchimento das informações.")
+        assistente_necessario = True
+
+    else:
+        conteudo = caminho.read_text(encoding='utf-8').strip()
+
+        if not conteudo:
+            print(f"\n  ⚠️  O arquivo {caminho.name} está vazio.")
+            assistente_necessario = True
+
+        else:
+            try:
+                dados = json.loads(conteudo)
+            except json.JSONDecodeError as e:
+                print(f"\n  ⚠️  O arquivo {caminho.name} tem JSON inválido: {e}")
+                print(    "  O arquivo será reconfigurado do zero.")
+                dados = {'email': {}, 'pessoas': {}}
+                assistente_necessario = True
+
+            # Garante que as seções obrigatórias existem
+            dados.setdefault('email', {})
+            dados.setdefault('pessoas', {})
+
+            # Verifica se algum campo está faltando
+            email_ok = all(dados['email'].get(c) for c in CAMPOS_EMAIL)
+            # destinatarios ficam em cada pessoa, não no bloco global de e-mail
+            pessoas_ok = bool(dados['pessoas']) and all(
+                all(p.get(c) is not None and p.get(c) != '' for c in CAMPOS_PESSOA)
+                for p in dados['pessoas'].values()
+            )
+            if not email_ok or not pessoas_ok:
+                assistente_necessario = True
+
+    # ── Chama o assistente se necessário ─────────────────────────────────────
+    if assistente_necessario:
+        dados = _assistente_configuracao(dados)
+        salvar_configuracao(caminho, dados)
+        print(f"\n  ✓ Configuração salva em: {caminho}")
+
+    # ── (Re)gera URL a partir de nome_dou e persiste no JSON ─────────────────
+    url_atualizada = False
+    for cfg in dados['pessoas'].values():
+        if cfg.get('nome_dou'):
+            nova_url = gerar_url(cfg['nome_dou'])
+            if cfg.get('url') != nova_url:
+                cfg['url'] = nova_url
+                url_atualizada = True
+    if url_atualizada and not assistente_necessario:
+        salvar_configuracao(caminho, dados)
+
+    # ── Converte data_referencia → datetime ───────────────────────────────────
+    for nome, cfg in dados['pessoas'].items():
+        dr = cfg.get('data_referencia')
+        if isinstance(dr, datetime):
+            pass  # já convertido (veio do assistente)
+        elif isinstance(dr, str):
+            try:
+                cfg['data_referencia'] = datetime.strptime(dr[:10], '%Y-%m-%d')
+            except ValueError:
+                print(f"\n  ⚠️  'data_referencia' inválida para '{nome}': '{dr}'")
+                print(    "  Por favor, corrija no assistente.")
+                cfg['data_referencia'] = _ler_data(f"  Nova data para '{nome}' (DD/MM/AAAA): ")
+                salvar_configuracao(caminho, dados)
+        else:
+            print(f"\n  ⚠️  'data_referencia' ausente para '{nome}'.")
+            cfg['data_referencia'] = _ler_data(f"  Data de referência para '{nome}' (DD/MM/AAAA): ")
+            salvar_configuracao(caminho, dados)
+
+    return dados
+
+
+def salvar_configuracao(caminho: Path, dados: dict) -> None:
+    """
+    Grava o dicionário de configuração de volta no arquivo JSON.
+    Converte datetime → string 'YYYY-MM-DD' antes de salvar.
+    """
+    dados_para_salvar = json.loads(json.dumps(dados, default=str))
+
+    for cfg in dados_para_salvar['pessoas'].values():
+        dr = cfg.get('data_referencia')
+        if isinstance(dr, str):
+            cfg['data_referencia'] = dr[:10]  # garante só YYYY-MM-DD
+
+    with open(caminho, 'w', encoding='utf-8') as f:
+        json.dump(dados_para_salvar, f, ensure_ascii=False, indent=2)
+
 
 # ============================================================================
 # FUNÇÕES DE CAPTURA WEB
@@ -292,23 +683,13 @@ def capturar_html(url, max_tentativas=10):
 
 
 def extrair_numero_resultados(html, nome):
-    """Extrai o número de resultados da busca do padrão 'X resultados para <strong>\"Nome\"</strong>'"""
+    """Extrai o número de resultados da busca do padrão 'X resultados para <strong>"Nome"</strong>'"""
     
-    # Tenta vários padrões possíveis, do mais específico ao mais genérico
     padroes = [
-        # Padrão 1: Com aspas duplas literais no HTML
         r'(\d+)\s+resultados?\s+para\s+<strong>"[^"]*"</strong>',
-        
-        # Padrão 2: Com aspas simples
         r"(\d+)\s+resultados?\s+para\s+<strong>'[^']*'</strong>",
-        
-        # Padrão 3: Sem aspas
         r'(\d+)\s+resultados?\s+para\s+<strong>[^<]+</strong>',
-        
-        # Padrão 4: Mais genérico, captura qualquer coisa depois de "resultados para"
         r'(\d+)\s+resultados?\s+para\s+<strong>',
-        
-        # Padrão 5: Versão HTML escapada
         r'(\d+)\s+resultados?\s+para\s+&lt;strong&gt;',
     ]
     
@@ -319,8 +700,6 @@ def extrair_numero_resultados(html, nome):
             print(f"  Número de resultados encontrados: {numero} (padrão {i})")
             return numero
     
-    # Se nenhum padrão funcionou, tenta buscar especificamente pelo nome
-    # Escapa caracteres especiais do nome para uso em regex
     nome_escapado = re.escape(nome)
     padrao_com_nome = rf'(\d+)\s+resultados?\s+para.*?{nome_escapado}'
     match = re.search(padrao_com_nome, html, re.IGNORECASE | re.DOTALL)
@@ -329,14 +708,12 @@ def extrair_numero_resultados(html, nome):
         print(f"  Número de resultados encontrados: {numero} (busca por nome)")
         return numero
     
-    # Debug: Mostra trechos do HTML que contêm "resultados para"
     print(f"  ⚠️  Não foi possível encontrar o número de resultados no HTML")
     print(f"  Debug: Procurando por 'resultados para' no HTML...")
     
-    # Busca ocorrências de "resultados para" para debug
     debug_matches = re.finditer(r'.{0,50}resultados?\s+para.{0,100}', html, re.IGNORECASE)
     for idx, match in enumerate(debug_matches, 1):
-        if idx <= 3:  # Mostra apenas as 3 primeiras ocorrências
+        if idx <= 3:
             trecho = match.group(0).replace('\n', ' ').strip()
             print(f"  Ocorrência {idx}: ...{trecho}...")
     
@@ -364,7 +741,7 @@ def extrair_data_edital(texto):
             try:
                 data_obj = datetime(int(ano), mes, int(dia))
                 return texto, data_obj
-            except:
+            except Exception:
                 pass
     
     return None, None
@@ -375,17 +752,14 @@ def analisar_editais_html(html, nome):
     if not html:
         return None
     
-    # Extrai o número de resultados da busca
     num_resultados = extrair_numero_resultados(html, nome)
     
-    # Procura por títulos de editais no JSON
     padrao_titulo = r'"title":"([^"]*DE \d{1,2} DE [A-ZÇÃÕ]+ DE \d{4}[^"]*)"'
     titulos = re.findall(padrao_titulo, html, re.IGNORECASE)
     
     total_editais = len(titulos)
     editais_com_data = []
     
-    # Extrai datas dos editais
     for titulo in titulos:
         data_str, data_obj = extrair_data_edital(titulo)
         if data_str and data_obj:
@@ -394,7 +768,6 @@ def analisar_editais_html(html, nome):
                 'data_obj': data_obj
             })
     
-    # Ordena por data (mais recente primeiro)
     editais_com_data.sort(key=lambda x: x['data_obj'], reverse=True)
     
     edital_mais_recente = editais_com_data[0] if editais_com_data else None
@@ -441,42 +814,64 @@ def limpar_screenshots_antigos(pasta, limite=10):
             print(f"  ✗ Erro ao remover arquivo: {e}")
 
 
-def sendEmail(nome, novidade, erro, detalhes='', screenshot_path=None):
+def nome_curto(nome: str) -> str:
+    """
+    Retorna primeiro + último nome da pessoa.
+    Exemplos:
+      'Fulano'              -> 'Fulano'
+      'Fulano Reis'         -> 'Fulano Reis'
+      'Fulano Guedes Reis'  -> 'Fulano Reis'
+    """
+    partes = nome.strip().split()
+    if len(partes) <= 2:
+        return nome.strip()
+    return f"{partes[0]} {partes[-1]}"
+
+
+def sendEmail(nome, novidade, erro, email_config, cfg_pessoa, url, detalhes='', screenshot_path=None):
     """Envia email com as informações do script"""
-    cfg = EMAIL_CONFIG
-    
+    cfg        = email_config
+    nome_fmt   = nome.title()           # ex: FULANO DE TALS → Fulano De Tals
+    nc         = nome_curto(nome_fmt)   # ex: Fulano Tals
+    primeiro   = nome_fmt.split()[0]    # ex: Fulano
+
     if erro == 1:
-        assunto = f"Erro no script do {nome}"
-        mensagem = f"Ocorreu um erro ao verificar os editais.\n\nDetalhes:\n{detalhes}\n\nAcesse o DOU:\n{PESSOAS[nome]['url']}"
-        
+        assunto  = f"{nc}, erro no script do DOU"
+        mensagem = f"Ocorreu um erro ao verificar os editais.\n\nDetalhes:\n{detalhes}\n\nAcesse o DOU:\n{url}"
     elif novidade == 0:
-        assunto = 'DOU 25 sem novidades'
-        mensagem = f"{nome}, continue acreditando!\nDeus é fiel!\n\n{detalhes}\n\nAcesse o DOU:\n{PESSOAS[nome]['url']}"
+        assunto  = f"{nc}, não há novidades no DOU"
+        mensagem = f"{primeiro}, continue acreditando!\nDeus é fiel!\n\n{detalhes}\n\nAcesse o DOU:\n{url}"
     elif novidade == 1:
-        assunto = 'ATENÇÃO! NOVIDADE DOU! VEJA O DOU!'
-        assunto = f'⚠️ {assunto} ⚠️'
-        mensagem = f"Novidade para {nome}!\n\n{detalhes}\n\nAcesse o DOU:\n{PESSOAS[nome]['url']}\n\nVerifique o screenshot anexo."
+        assunto  = f"⚠️ {nc}, NOVIDADE NO DOU! ACESSE JÁ! ⚠️"
+        mensagem = f"Novidade para {nome_fmt}!\n\n{detalhes}\n\nAcesse o DOU:\n{url}\n\nVerifique o screenshot anexo."
     
+    # destinatarios vem da configuração da pessoa (lista de 1 ou mais endereços)
+    destinatarios = cfg_pessoa.get('destinatarios', [])
+    if isinstance(destinatarios, str):
+        destinatarios = [destinatarios]  # compatibilidade com JSONs antigos
+    if not destinatarios:
+        print(f"  ⚠️  Nenhum destinatário configurado para '{nome}'. E-mail não enviado.")
+        return
+
     msg = EmailMessage()
-    msg['From'] = cfg['remetente']
-    msg['To'] = cfg['destinatario']
+    msg['From']    = cfg['remetente']
+    msg['To']      = ', '.join(destinatarios)
     msg['Subject'] = assunto
     msg.set_content(mensagem)
-    
-    # Anexar screenshot se houver
+
     if screenshot_path and os.path.exists(screenshot_path):
         with open(screenshot_path, 'rb') as f:
             img_data = f.read()
             filename = f'{nome}_{"novidade" if novidade == 1 else "erro"}.png'
             msg.add_attachment(img_data, maintype='image', subtype='png', filename=filename)
-    
+
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as email:
             email.login(cfg['remetente'], cfg['senha'])
             email.send_message(msg)
-        print(f"  ✓ Email enviado com sucesso!")
+        print(f"  ✓ E-mail enviado para: {', '.join(destinatarios)}")
     except Exception as e:
-        print(f"  ✗ Erro ao enviar email: {e}")
+        print(f"  ✗ Erro ao enviar e-mail: {e}")
 
 # ============================================================================
 # FUNÇÕES DE NAVEGADOR (BACKUP)
@@ -489,174 +884,297 @@ def abrir_navegador_e_capturar(nome, fav_x, fav_y):
     screenWidth, screenHeight = pyautogui.size()
     print(f"  Resolução da tela: {screenWidth}x{screenHeight}")
     
-    # Abrir Firefox
     pyautogui.moveTo(210, 751)
     time.sleep(4)
     pyautogui.click()
     time.sleep(60)
     
-    # Nova aba
     pyautogui.hotkey('ctrl', 't')
     time.sleep(60)
     
-    # Clica no favorito
     pyautogui.moveTo(fav_x, fav_y)
     time.sleep(8)
     pyautogui.click()
     time.sleep(60)
     
-    # Scroll para mostrar conteúdo
     pyautogui.scroll(-5)
     time.sleep(60)
     
-    # Captura screenshot
     desktop_path = obter_caminho_desktop()
     pasta_novidades = os.path.join(desktop_path, 'DOU_2025_novidades')
     screenshot_path = capturar_screenshot(pasta_novidades, f'{nome}_')
     
-    # Fecha a aba
     time.sleep(20)
     pyautogui.hotkey('ctrl', 'w')
     time.sleep(20)
     pyautogui.hotkey('ctrl', 'w')
-
     
     return screenshot_path
+
+# ============================================================================
+# CONFIRMAÇÃO INTERATIVA DE NOVO NORMAL
+# ============================================================================
+
+TIMEOUT_CONFIRMACAO = 60  # segundos disponíveis para o usuário responder
+
+
+def _input_com_timeout(prompt: str, timeout: int) -> str | None:
+    """
+    Exibe 'prompt' e aguarda entrada do usuário por até 'timeout' segundos.
+    Retorna a string digitada ou None se o tempo esgotar.
+    Funciona apenas em sistemas Unix/Linux (usa select).
+    """
+    print(prompt, end='', flush=True)
+    leitura, _, _ = select.select([sys.stdin], [], [], timeout)
+    if leitura:
+        return sys.stdin.readline().strip()
+    print()  # quebra de linha após o timeout
+    return None
+
+
+def _barra_regressiva(segundos: int) -> None:
+    """Exibe uma contagem regressiva de segundos no mesmo terminal."""
+    for restante in range(segundos, 0, -1):
+        print(f"\r  ⏳ Tempo restante: {restante:>3}s  ", end='', flush=True)
+        time.sleep(1)
+    print("\r" + " " * 40 + "\r", end='', flush=True)
+
+
+def confirmar_novo_normal(nome: str, motivos: list[str], resultado: dict, config: dict) -> bool:
+    """
+    Mostra as alterações detectadas e pergunta ao usuário (por 60 s) se deseja
+    reconhecê-las como o novo normal.
+
+    Retorna True  → usuário confirmou: atualiza o JSON e NÃO envia e-mail.
+    Retorna False → usuário recusou ou tempo esgotou: envia e-mail normalmente.
+    """
+    separador = "=" * 70
+
+    print(f"\n{separador}")
+    print(f"  ⚠️  NOVIDADE DETECTADA PARA: {nome}")
+    print(separador)
+    print("  Alterações encontradas:")
+    for m in motivos:
+        print(f"    • {m}")
+    print()
+
+    mais_recente = resultado.get('edital_mais_recente')
+    if mais_recente:
+        print(f"  Edital mais recente encontrado:")
+        print(f"    Título : {mais_recente['titulo']}")
+        print(f"    Data   : {mais_recente['data_obj'].strftime('%d/%m/%Y')}")
+    print()
+
+    print(f"  Você tem {TIMEOUT_CONFIRMACAO} segundos para responder.")
+    print("  Se não responder, o e-mail de novidade será enviado automaticamente.")
+    print(separador)
+
+    # Roda a contagem regressiva em paralelo com a leitura de entrada
+    # Como select.select bloqueia o thread principal, fazemos a barra antes
+    # do prompt e contamos o tempo na função de input.
+    resposta = _input_com_timeout(
+        "\n  Reconhecer como novo normal e NÃO enviar e-mail? [s/N] → ",
+        TIMEOUT_CONFIRMACAO
+    )
+
+    if resposta is None:
+        print("  ⏰ Tempo esgotado. Enviando e-mail de novidade...")
+        return False
+
+    if resposta.strip().lower() in ('s', 'sim', 'y', 'yes'):
+        print("\n  ✅ Novo normal reconhecido! Atualizando configuração...")
+        _atualizar_config_novo_normal(nome, resultado, config)
+        return True
+    else:
+        print("\n  📧 Confirmação recusada. Enviando e-mail de novidade...")
+        return False
+
+
+def _atualizar_config_novo_normal(nome: str, resultado: dict, config: dict) -> None:
+    """
+    Atualiza em memória (dict config) os campos de referência para a pessoa
+    com os valores recém-detectados, e persiste no arquivo JSON.
+    """
+    cfg_pessoa = config['pessoas'][nome]
+
+    total          = resultado['total_editais']
+    num_resultados = resultado['num_resultados']
+    mais_recente   = resultado['edital_mais_recente']
+
+    # Atualiza contadores
+    cfg_pessoa['numero_de_editais_com_o_padrao_de_data_no_titulo'] = total
+
+    if num_resultados is not None:
+        cfg_pessoa['numero_de_editais_encontrados_na_pesquisa_do_site'] = num_resultados
+
+    # Atualiza edital e data de referência
+    if mais_recente:
+        cfg_pessoa['edital_referencia'] = mais_recente['titulo']
+        cfg_pessoa['data_referencia']   = mais_recente['data_obj']
+
+    # Persiste no arquivo JSON
+    salvar_configuracao(CONFIG_PATH, config)
+
+    print(f"  ✓ Configuração atualizada para '{nome}':")
+    print(f"      editais com data : {total}")
+    if num_resultados is not None:
+        print(f"      resultados no site: {num_resultados}")
+    if mais_recente:
+        print(f"      edital referência: {mais_recente['titulo']}")
+        print(f"      data referência  : {mais_recente['data_obj'].strftime('%d/%m/%Y')}")
 
 # ============================================================================
 # FUNÇÃO PRINCIPAL DE ANÁLISE
 # ============================================================================
 
-def verificar_pessoa(nome, config):
-    """Verifica os editais de uma pessoa"""
-    print("\n" + "="*80)
-    print(f"VERIFICANDO EDITAIS PARA: {nome}")
-    print("="*80)
+def verificar_pessoa(nome: str, config: dict) -> None:
+    """Verifica os editais de uma pessoa usando a configuração carregada do JSON."""
 
-    # Referências individuais por pessoa
-    edital_referencia = config['edital_referencia']
-    data_referencia   = config['data_referencia']
+    cfg_pessoa = config['pessoas'][nome]
+    email_cfg  = config['email']
+
+    edital_referencia = cfg_pessoa['edital_referencia']
+    data_referencia   = cfg_pessoa['data_referencia']
+    url               = cfg_pessoa['url']
+
+    print("\n" + "=" * 80)
+    print(f"VERIFICANDO EDITAIS PARA: {nome}")
+    print("=" * 80)
 
     # 1. Captura o HTML
-    html = capturar_html(config['url'])
-    
+    html = capturar_html(url)
+
     if not html:
         print(f"  ✗ Não foi possível acessar o site para {nome}")
         desktop_path = obter_caminho_desktop()
-        pasta_erros = os.path.join(desktop_path, 'prints_dos_erros_do_script')
+        pasta_erros  = os.path.join(desktop_path, 'prints_dos_erros_do_script')
         screenshot_path = capturar_screenshot(pasta_erros, f'{nome}_erro_conexao_')
-        sendEmail(nome, 0, 1, "Falha ao acessar o site do DOU", screenshot_path)
+        sendEmail(nome, 0, 1, email_cfg, cfg_pessoa, url, "Falha ao acessar o site do DOU", screenshot_path)
         return
-    
+
     # 2. Analisa os editais
     resultado = analisar_editais_html(html, nome)
-    
+
     if not resultado:
         print(f"  ✗ Não foi possível analisar os editais para {nome}")
         desktop_path = obter_caminho_desktop()
-        pasta_erros = os.path.join(desktop_path, 'prints_dos_erros_do_script')
+        pasta_erros  = os.path.join(desktop_path, 'prints_dos_erros_do_script')
         screenshot_path = capturar_screenshot(pasta_erros, f'{nome}_erro_analise_')
-        sendEmail(nome, 0, 1, "Erro ao analisar os editais", screenshot_path)
+        sendEmail(nome, 0, 1, email_cfg, cfg_pessoa, url, "Erro ao analisar os editais", screenshot_path)
         return
-    
-    total          = resultado['total_editais']
-    esperado       = config['numero_de_editais_com_o_padrao_de_data_no_titulo']
-    num_resultados = resultado['num_resultados']
-    numero_de_editais_encontrados_na_pesquisa_do_site = config['numero_de_editais_encontrados_na_pesquisa_do_site']
-    mais_recente   = resultado['edital_mais_recente']
-    
+
+    total                                            = resultado['total_editais']
+    esperado                                         = cfg_pessoa['numero_de_editais_com_o_padrao_de_data_no_titulo']
+    num_resultados                                   = resultado['num_resultados']
+    numero_de_editais_encontrados_na_pesquisa_do_site = cfg_pessoa['numero_de_editais_encontrados_na_pesquisa_do_site']
+    mais_recente                                     = resultado['edital_mais_recente']
+
     print(f"\n  Total de editais com data encontrados: {total}")
-    print(f"  Total de editais com data esperados: {esperado}")
-    
+    print(f"  Total de editais com data esperados:   {esperado}")
+
     if num_resultados is not None:
-        print(f"  Número de resultados no site: {num_resultados}")
-        print(f"  Número de resultados esperados no site : {numero_de_editais_encontrados_na_pesquisa_do_site}")
-    
+        print(f"  Número de resultados no site:         {num_resultados}")
+        print(f"  Número de resultados esperados:       {numero_de_editais_encontrados_na_pesquisa_do_site}")
+
     if mais_recente:
-        print(f"  Edital mais recente: {mais_recente['titulo'][:80]}...")
+        print(f"  Edital mais recente: {mais_recente['titulo'][:80]}")
         print(f"  Data: {mais_recente['data_obj'].strftime('%d/%m/%Y')}")
-    
+
     # 3. Verifica se há novidades
     tem_novidade = False
     motivo = []
-    
+
     if total != esperado:
         tem_novidade = True
         motivo.append(f"Número de editais mudou: {esperado} → {total}")
-    
+
     if num_resultados is not None and num_resultados != numero_de_editais_encontrados_na_pesquisa_do_site:
         tem_novidade = True
-        motivo.append(f"Número de resultados no site mudou: {numero_de_editais_encontrados_na_pesquisa_do_site} → {num_resultados}")
-    
+        motivo.append(
+            f"Número de resultados no site mudou: "
+            f"{numero_de_editais_encontrados_na_pesquisa_do_site} → {num_resultados}"
+        )
+
     if mais_recente:
         if mais_recente['data_obj'] > data_referencia:
             tem_novidade = True
             motivo.append(f"Novo edital mais recente: {mais_recente['data_obj'].strftime('%d/%m/%Y')}")
-            motivo.append(f"Título: {mais_recente['titulo'][:80]}...")
+            motivo.append(f"Título: {mais_recente['titulo'][:80]}")
         elif edital_referencia not in mais_recente['titulo']:
             tem_novidade = True
             motivo.append("Edital de referência não é o mais recente")
-    
+
     # 4. Age conforme o resultado
     if tem_novidade:
-        print(f"\n  ⚠️  NOVIDADE DETECTADA!")
-        for m in motivo:
-            print(f"      - {m}")
-        
-        # Abre navegador e captura screenshot
-        screenshot_path = abrir_navegador_e_capturar(nome, config['fav_x'], config['fav_y'])
-        
-        # Limpa screenshots antigos
-        desktop_path = obter_caminho_desktop()
+        # ── Pergunta ao usuário se é o novo normal ───────────────────────────
+        novo_normal_confirmado = confirmar_novo_normal(nome, motivo, resultado, config)
+
+        if novo_normal_confirmado:
+            # Usuário reconheceu: não envia e-mail, configuração já foi salva
+            print(f"\n  ✓ Monitoramento atualizado para '{nome}'. Nenhum e-mail enviado.")
+            return
+
+        # ── Usuário não confirmou: abre navegador, captura e envia e-mail ────
+        screenshot_path = abrir_navegador_e_capturar(
+            nome, cfg_pessoa['fav_x'], cfg_pessoa['fav_y']
+        )
+
+        desktop_path   = obter_caminho_desktop()
         pasta_novidades = os.path.join(desktop_path, 'DOU_2025_novidades')
         limpar_screenshots_antigos(pasta_novidades, 20)
-        
-        # Envia email
-        detalhes = f"Total de títulos com data: {total} (esperado: {esperado})\n"
+
+        detalhes  = f"Total de títulos com data: {total} (esperado: {esperado})\n"
         if num_resultados is not None:
-            detalhes += f"Número de resultados no site: {num_resultados} (esperado: {numero_de_editais_encontrados_na_pesquisa_do_site})\n"
+            detalhes += (
+                f"Número de resultados no site: {num_resultados} "
+                f"(esperado: {numero_de_editais_encontrados_na_pesquisa_do_site})\n"
+            )
         detalhes += "\n".join(motivo)
-        sendEmail(nome, 1, 0, detalhes, screenshot_path)
-        
+        sendEmail(nome, 1, 0, email_cfg, cfg_pessoa, url, detalhes, screenshot_path)
+
     else:
         print(f"\n  ✓ SEM NOVIDADES")
         print(f"      - {total} editais com data encontrados (conforme esperado)")
         if num_resultados is not None:
             print(f"      - {num_resultados} resultados de editais encontrados no site (conforme esperado)")
         print(f"      - Edital de referência continua o mais recente")
-        
-        detalhes = f"Editais com data: {total}\n"
+
+        detalhes  = f"Editais com data: {total}\n"
         if num_resultados is not None:
             detalhes += f"Número de resultados no site: {num_resultados}\n"
         detalhes += f"Edital mais recente: {edital_referencia}"
-        sendEmail(nome, 0, 0, detalhes)
+        sendEmail(nome, 0, 0, email_cfg, cfg_pessoa, url, detalhes)
 
 # ============================================================================
 # EXECUÇÃO PRINCIPAL
 # ============================================================================
 
 if __name__ == "__main__":
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("MONITOR DE EDITAIS DOU")
     print(f"Data/Hora: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
-    print("="*80)
-    
+    print("=" * 80)
+
+    # Carrega configuração do JSON (cria/completa interativamente se necessário)
+    config = carregar_configuracao(CONFIG_PATH)
+    print(f"\n✓ Configuração carregada: {CONFIG_PATH}")
+    print(f"  Pessoas monitoradas : {', '.join(config['pessoas'].keys())}")
+
     try:
-        # Verifica cada pessoa
-        for nome, config in PESSOAS.items():
+        for nome in config['pessoas']:
             verificar_pessoa(nome, config)
-            time.sleep(10)  # Pausa entre verificações
-        
-        print("\n" + "="*80)
+            time.sleep(10)
+
+        print("\n" + "=" * 80)
         print("VERIFICAÇÃO CONCLUÍDA COM SUCESSO!")
-        print("="*80 + "\n")
-        
+        print("=" * 80 + "\n")
+
         #Aguarda 120 segundos
         #time.sleep(120)
 
         #Desliga o computador
         #subprocess.run(['sudo', '/sbin/shutdown', '-h', 'now'], check=True)
-        
+
     except KeyboardInterrupt:
         print("\n\n✗ Execução interrompida pelo usuário.")
     except Exception as e:
