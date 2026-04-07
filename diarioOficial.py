@@ -834,16 +834,16 @@ def sendEmail(nome, novidade, erro, email_config, cfg_pessoa, url, detalhes='', 
     nome_fmt   = nome.title()           # ex: FULANO DE TALS → Fulano De Tals
     nc         = nome_curto(nome_fmt)   # ex: Fulano Tals
     primeiro   = nome_fmt.split()[0]    # ex: Fulano
-
+    erro = 1
     if erro == 1:
-        assunto  = f"{nc}, erro no script do DOU"
-        mensagem = f"Ocorreu um erro ao verificar os editais.\n\nDetalhes:\n{detalhes}\n\nAcesse o DOU:\n{url}"
+        assunto  = f"DOU. Erro para {nc}."
+        mensagem = f"Ocorreu um erro ao verificar os editais de\n {nome}.\n\nDetalhes:\n{detalhes}\n\nAcesse o DOU:\n{url}"
     elif novidade == 0:
-        assunto  = f"{nc}, não há novidades no DOU"
-        mensagem = f"{primeiro}, continue acreditando!\nDeus é fiel!\n\n{detalhes}\n\nAcesse o DOU:\n{url}"
+        assunto  = f"DOU inalterado para {nc}."
+        mensagem = f"{nome},\ncontinue acreditando!\nDeus é fiel!\n\n{detalhes}\n\nAcesse o DOU:\n{url}"
     elif novidade == 1:
-        assunto  = f"⚠️ {nc}, NOVIDADE NO DOU! ACESSE JÁ! ⚠️"
-        mensagem = f"Novidade para {nome_fmt}!\n\n{detalhes}\n\nAcesse o DOU:\n{url}\n\nVerifique o screenshot anexo."
+        assunto  = f"⚠️Novidade DOU para {primeiro}!⚠️"
+        mensagem = f"Novidade para {nome}!\n\n{detalhes}\n\nAcesse o DOU:\n{url}\n\nVerifique o screenshot anexo."
     
     # destinatarios vem da configuração da pessoa (lista de 1 ou mais endereços)
     destinatarios = cfg_pessoa.get('destinatarios', [])
