@@ -834,7 +834,7 @@ def sendEmail(nome, novidade, erro, email_config, cfg_pessoa, url, detalhes='', 
     nome_fmt   = nome.title()           # ex: FULANO DE TALS → Fulano De Tals
     nc         = nome_curto(nome_fmt)   # ex: Fulano Tals
     primeiro   = nome_fmt.split()[0]    # ex: Fulano
-    erro = 1
+
     if erro == 1:
         assunto  = f"DOU. Erro para {nc}."
         mensagem = f"Ocorreu um erro ao verificar os editais de\n {nome}.\n\nDetalhes:\n{detalhes}\n\nAcesse o DOU:\n{url}"
