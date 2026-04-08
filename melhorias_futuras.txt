@@ -1,9 +1,16 @@
 Melhorias Futuras
-[] Substituir mensagem do e-mail com título "Dou inalterado para ..." de "Edital mais recente: EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025" para
-  "Edital com data no títilo mais recente: EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025"
 
+[] Substituir a mensagem do e-mail com o título "Dou inalterado para ..." de "Edital mais recente: EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025" para "Edital com data no título mais recente: EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025".
+
+  "Edital com data no título mais recente: EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025."
   Editais com data: 3
-  Número de resultados no site: 9
-  Edital mais recente: EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025
-  
-[] Trocar o arquivo .json por outro que seja mais fácil editar manualmente.
+  Número de resultados no site: 9.
+  Edital mais recente: EDITAL Nº 8 - FUB, DE 19 DE SETEMBRO DE 2025.
+
+[] Trocar o arquivo .json por outro que seja mais fácil de editar manualmente.
+
+[] Adicionar um menu no início do script que permita cadastrar novas pessoas, mesmo que o sistema já tenha sido configurado anteriormente.
+
+[] Aceitar arquivo contendo muitas pessoas a serem adicionadas.
+
+[] Configurar script para enviar muitos e-mails sem atraso. Muitos e-mails simultâneos. 
