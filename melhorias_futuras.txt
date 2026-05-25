@@ -14,3 +14,7 @@ Melhorias Futuras
 [] Aceitar arquivo contendo muitas pessoas a serem adicionadas.
 
 [] Configurar script para enviar muitos e-mails sem atraso. Muitos e-mails simultâneos. 
+
+[RESOLVIDO] As vezes o script gera um falso positivo quando o site do DOU erra e retorna 0 para as variáveis.
+
+[] Corrigir o seguinte BUG. Ao encontrar novidade para uma pessoa o script não continua pesquisando as outras pessoas até dar timeout.
