@@ -1228,6 +1228,10 @@ def analisar_editais_html(html, nome):
     
     edital_mais_recente = editais_com_data[0] if editais_com_data else None
     
+    #total_editais = quantidade de editais com data
+    #num_resultados = """Extrai o número de resultados da busca do padrão 'X resultados para <strong>"Nome"</strong>'"""
+    #edital_mais recente = edital mais recente
+    #todos_editais = lista de todos os editais com data
     return {
         'total_editais': total_editais,
         'num_resultados': num_resultados,
@@ -1449,11 +1453,12 @@ def verificar_pessoa(nome: str, config: dict) -> bool:
         sendEmail(nome, 0, 1, email_cfg, cfg_pessoa, url, "Erro ao analisar os editais")
         return False
 
-    total                                            = resultado['total_editais']
-    esperado                                         = cfg_pessoa['numero_de_editais_com_o_padrao_de_data_no_titulo']
-    num_resultados                                   = resultado['num_resultados']
+    total                                             = resultado['total_editais']
+    esperado                                          = cfg_pessoa['numero_de_editais_com_o_padrao_de_data_no_titulo']
+    num_resultados                                    = resultado['num_resultados']
     numero_de_editais_encontrados_na_pesquisa_do_site = cfg_pessoa['numero_de_editais_encontrados_na_pesquisa_do_site']
-    mais_recente                                     = resultado['edital_mais_recente']
+    mais_recente                                      = resultado['edital_mais_recente'] 
+
 
     print(f"\n  Total de editais com data encontrados: {total}")
     print(f"  Total de editais com data esperados:   {esperado}")
@@ -1470,17 +1475,25 @@ def verificar_pessoa(nome: str, config: dict) -> bool:
     tem_novidade = False
     motivo = []
 
-    if total != esperado:
+    # A variável total é igual ao número de títulos com o padrão de data da pesquisa atual.
+    # A variável esperado é o número de títulos com o padrão de data previamente encontrado no arquivo .json
+    # O if abaixo compara a quantidade de editais (com título encontrados no site no momento da procura) com a quantidade previamente armazenada no arquivo .json.
+    # Resumindo "Houve alteração na quantidade de editais com data?".
+    if total != 0 and total != esperado:
         tem_novidade = True
         motivo.append(f"Número de editais mudou: {esperado} → {total}")
-
-    if num_resultados is not None and num_resultados != numero_de_editais_encontrados_na_pesquisa_do_site:
+        
+    # num_resultados é """Extrai o número de resultados da busca do padrão 'X resultados para <strong>"Nome"</strong>'"""
+    # numero_de_editais_encontrados_na_pesquisa_do_site está no .json
+    # Resumindo "Houve alteração na quantidade de editais (com e sem data)?"
+    if num_resultados != 0 and num_resultados is not None and num_resultados != numero_de_editais_encontrados_na_pesquisa_do_site:
         tem_novidade = True
         motivo.append(
             f"Número de resultados no site mudou: "
             f"{numero_de_editais_encontrados_na_pesquisa_do_site} → {num_resultados}"
         )
-
+    
+    #Resumo "Há edital mais recente?"
     if mais_recente:
         if mais_recente['data_obj'] > data_referencia:
             tem_novidade = True
@@ -1525,7 +1538,6 @@ def verificar_pessoa(nome: str, config: dict) -> bool:
             _relatorio_registrar_musica(nome, repeticoes_musica, musica)
 
         return True  # novidade confirmada e e-mail enviado
-
     else:
         print(f"\n  ✓ SEM NOVIDADES")
         print(f"      - {total} editais com data encontrados (conforme esperado)")
