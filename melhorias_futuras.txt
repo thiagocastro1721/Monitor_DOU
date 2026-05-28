@@ -28,4 +28,12 @@ Caso positivo, perguntar a porcentagem. Após a execução por padrão o brilho 
 
 [] Listar bibliotecas de dependências necessárias que ainda não foram instaladas. Perguntar se deseja instalar todas automaticamente.
 
-[] Escrever Read me como documentação. Deixar claro que o script só funciona em sistemas linux.
+[] Escrever Read me como documentação. Deixar claro que o script só funciona em sistemas Linux.
+
+[] Facilitar configuração manual. Quando o usuário edita manualmente o arquivo de configuração config_editais.json e digita algum zero à esquerda, o script para de reconhecer o arquivo e para.
+Exemplo: 
+"hora_inicio": 2 (certo)
+"hora_inicio": 02 (errado)
+"minuto_limite": 0 (certo)
+"minuto_limite": 00 (errado)
+
