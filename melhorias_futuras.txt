@@ -25,3 +25,5 @@ e-mail somente quando houver novidade no DOU.
 [] Perguntar ao usuário se ele gostaria de modificar a intensidade do brilho da tela durante a execução do script. 
 Caso positivo, perguntar a porcentagem. Após a execução por padrão o brilho volta à porcentagem anterior antes da execução do script.
 Útil para economizar energia ou garantir brilho de tela desejado.
+
+[] Listar bibliotecas de dependências necessárias que ainda não foram instaladas. Perguntar se deseja instalar todas automaticamente.
