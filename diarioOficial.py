@@ -229,10 +229,318 @@ from email.message import EmailMessage
 from datetime import datetime, timedelta
 from pathlib import Path
 import re
+import threading
+import socket
+import shutil
+import psutil
 
 # ============================================================================
-# RELATÓRIO DE EXECUÇÃO (acumulado ao longo do script)
+# SISTEMA DE LOG EM ARQUIVO (DOU_logs/)
 # ============================================================================
+
+# Pasta onde os logs são armazenados (mesma pasta do script)
+_PASTA_LOGS = Path(__file__).parent / 'DOU_logs'
+
+# Limite máximo de arquivos na pasta antes de excluir o mais antigo
+_MAX_ARQUIVOS_LOG = 101
+
+# Referência global ao arquivo de log aberto nesta execução
+_arquivo_log = None
+
+# Referência global à thread de monitoramento periódico
+_thread_monitor = None
+_monitor_ativo   = False
+
+
+class _TeeStream:
+    """
+    Duplica as escritas para dois streams simultaneamente:
+    o stream original (terminal) e o arquivo de log.
+    Usado para substituir sys.stdout e sys.stderr.
+    """
+    def __init__(self, stream_original, arquivo):
+        self._stream_original = stream_original
+        self._arquivo          = arquivo
+
+    def write(self, dados):
+        self._stream_original.write(dados)
+        try:
+            self._arquivo.write(dados)
+            self._arquivo.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        self._stream_original.flush()
+        try:
+            self._arquivo.flush()
+        except Exception:
+            pass
+
+    def fileno(self):
+        # Necessário para compatibilidade com select() e funções que usam fileno
+        return self._stream_original.fileno()
+
+    def isatty(self):
+        return self._stream_original.isatty()
+
+    def readable(self):
+        return False
+
+    def writable(self):
+        return True
+
+
+def _iniciar_log() -> None:
+    """
+    Cria a pasta DOU_logs (se necessário), abre o arquivo de log com nome
+    baseado no timestamp atual (ex.: 202605271741.txt) e redireciona
+    stdout/stderr para um TeeStream que escreve simultaneamente no terminal
+    e no arquivo. Se a pasta já tiver 101+ arquivos, exclui o mais antigo.
+    """
+    global _arquivo_log
+
+    # Cria a pasta se não existir
+    _PASTA_LOGS.mkdir(parents=True, exist_ok=True)
+
+    # Remove o arquivo mais antigo se a pasta atingiu o limite
+    _limpar_logs_antigos()
+
+    # Nome do arquivo: timestamp no formato YYYYMMDDHHmm.txt
+    nome_arquivo = datetime.now().strftime('%Y%m%d%H%M') + '.txt'
+    caminho_log  = _PASTA_LOGS / nome_arquivo
+
+    # Abre o arquivo de log (modo append para não perder dados em caso de falha)
+    _arquivo_log = open(caminho_log, 'a', encoding='utf-8', buffering=1)
+
+    # Escreve cabeçalho inicial no log
+    _arquivo_log.write(
+        f"{'=' * 80}\n"
+        f"LOG DE EXECUÇÃO — MONITOR DE EDITAIS DOU\n"
+        f"Início : {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
+        f"Arquivo: {caminho_log}\n"
+        f"{'=' * 80}\n\n"
+    )
+    _arquivo_log.flush()
+
+    # Redireciona stdout e stderr para o TeeStream
+    sys.stdout = _TeeStream(sys.__stdout__, _arquivo_log)
+    sys.stderr = _TeeStream(sys.__stderr__, _arquivo_log)
+
+    # Imprime no terminal/log confirmando o início do log
+    print(f"  📄 Log iniciado: {caminho_log}")
+
+
+def _encerrar_log() -> None:
+    """Registra o encerramento e fecha o arquivo de log."""
+    global _arquivo_log, _monitor_ativo
+
+    # Para a thread de monitoramento periódico
+    _monitor_ativo = False
+
+    if _arquivo_log:
+        try:
+            _arquivo_log.write(
+                f"\n{'=' * 80}\n"
+                f"Encerramento: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
+                f"{'=' * 80}\n"
+            )
+            _arquivo_log.flush()
+        except Exception:
+            pass
+        # Restaura stdout/stderr originais antes de fechar o arquivo
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        try:
+            _arquivo_log.close()
+        except Exception:
+            pass
+        _arquivo_log = None
+
+
+def _limpar_logs_antigos() -> None:
+    """
+    Se a pasta DOU_logs tiver _MAX_ARQUIVOS_LOG ou mais arquivos .txt,
+    exclui o mais antigo (por nome, que é ordenável por timestamp).
+    """
+    arquivos = sorted(_PASTA_LOGS.glob('*.txt'))
+    while len(arquivos) >= _MAX_ARQUIVOS_LOG:
+        mais_antigo = arquivos.pop(0)
+        try:
+            mais_antigo.unlink()
+            # Imprime direto no stream original para não causar recursão
+            sys.__stdout__.write(f"  🗑️  Log antigo removido: {mais_antigo.name}\n")
+        except Exception as e:
+            sys.__stdout__.write(f"  ⚠️  Não foi possível remover {mais_antigo.name}: {e}\n")
+
+
+# ============================================================================
+# MONITORAMENTO PERIÓDICO: REDE, CPU, MEMÓRIA, DISCO
+# ============================================================================
+
+def _checar_rede(host: str = '8.8.8.8', timeout: int = 5) -> bool:
+    """
+    Verifica se há conectividade com a internet tentando abrir um socket
+    TCP para o DNS do Google (8.8.8.8:53). Retorna True se conectado.
+    """
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, 53))
+        return True
+    except (socket.error, OSError):
+        return False
+
+
+def _ping(host: str = '8.8.8.8') -> str:
+    """
+    Executa um ping de 3 pacotes e retorna um resumo da latência.
+    Retorna 'FALHOU' se o ping não obtiver resposta.
+    """
+    try:
+        resultado = subprocess.run(
+            ['ping', '-c', '3', '-W', '3', host],
+            capture_output=True, text=True, timeout=15
+        )
+        # Extrai linha de estatísticas (ex.: 'rtt min/avg/max/mdev = ...')
+        for linha in resultado.stdout.splitlines():
+            if 'rtt' in linha or 'round-trip' in linha:
+                return linha.strip()
+        return 'sem resposta (ping)' if resultado.returncode != 0 else 'ok (sem estatísticas)'
+    except Exception as e:
+        return f'ERRO: {e}'
+
+
+def _snapshot_sistema() -> dict:
+    """
+    Coleta um snapshot do estado atual do sistema:
+    rede, CPU, memória, disco e bateria (se disponível).
+    """
+    snapshot = {
+        'horario'  : datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
+        'rede_ok'  : _checar_rede(),
+        'ping'     : None,
+        'cpu_pct'  : None,
+        'mem_total': None,
+        'mem_uso'  : None,
+        'mem_pct'  : None,
+        'disco_livre_gb': None,
+        'disco_pct': None,
+        'bateria'  : None,
+        'carregando': None,
+    }
+
+    # Ping apenas se há rede
+    if snapshot['rede_ok']:
+        snapshot['ping'] = _ping()
+    else:
+        snapshot['ping'] = 'SEM REDE — ping não realizado'
+
+    # CPU e Memória via psutil
+    try:
+        snapshot['cpu_pct']   = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory()
+        snapshot['mem_total'] = round(mem.total / (1024 ** 3), 1)
+        snapshot['mem_uso']   = round(mem.used  / (1024 ** 3), 1)
+        snapshot['mem_pct']   = mem.percent
+    except Exception:
+        pass
+
+    # Disco (partição raiz)
+    try:
+        disco = psutil.disk_usage('/')
+        snapshot['disco_livre_gb'] = round(disco.free / (1024 ** 3), 1)
+        snapshot['disco_pct']      = disco.percent
+    except Exception:
+        pass
+
+    # Bateria
+    try:
+        bat = psutil.sensors_battery()
+        if bat:
+            snapshot['bateria']    = round(bat.percent, 1)
+            snapshot['carregando'] = bat.power_plugged
+    except Exception:
+        pass
+
+    return snapshot
+
+
+def _logar_snapshot(snapshot: dict, prefixo: str = '  📊') -> None:
+    """Imprime (e portanto grava no log) o snapshot do sistema."""
+    rede_str = '✓ Conectado' if snapshot['rede_ok'] else '✗ SEM REDE'
+    print(
+        f"\n{prefixo} MONITORAMENTO DO SISTEMA [{snapshot['horario']}]\n"
+        f"     Rede    : {rede_str}\n"
+        f"     Ping    : {snapshot['ping']}\n"
+        f"     CPU     : {snapshot['cpu_pct']}%\n"
+        f"     Memória : {snapshot['mem_uso']} GB / {snapshot['mem_total']} GB "
+        f"({snapshot['mem_pct']}%)\n"
+        f"     Disco   : {snapshot['disco_livre_gb']} GB livres "
+        f"({snapshot['disco_pct']}% usado)\n"
+        f"     Bateria : "
+        + (
+            f"{snapshot['bateria']}% {'(carregando)' if snapshot['carregando'] else '(descarregando)'}"
+            if snapshot['bateria'] is not None else 'não detectada'
+        )
+    )
+    # Alerta se a rede caiu
+    if not snapshot['rede_ok']:
+        print(f"  ⚠️  ALERTA: SEM CONECTIVIDADE COM A INTERNET [{snapshot['horario']}]")
+    # Alerta se o disco estiver quase cheio (> 90%)
+    if snapshot['disco_pct'] and snapshot['disco_pct'] > 90:
+        print(f"  ⚠️  ALERTA: DISCO QUASE CHEIO ({snapshot['disco_pct']}% usado)")
+    # Alerta se a memória estiver quase esgotada (> 90%)
+    if snapshot['mem_pct'] and snapshot['mem_pct'] > 90:
+        print(f"  ⚠️  ALERTA: MEMÓRIA QUASE ESGOTADA ({snapshot['mem_pct']}% usada)")
+    # Alerta bateria baixa (< 15%) e descarregando
+    if snapshot['bateria'] is not None and snapshot['bateria'] < 15 and not snapshot['carregando']:
+        print(f"  ⚠️  ALERTA: BATERIA BAIXA ({snapshot['bateria']}%) E DESCARREGANDO")
+
+
+def _thread_monitoramento_periodico(intervalo_segundos: int = 300) -> None:
+    """
+    Thread que executa em segundo plano, coletando e registrando um snapshot
+    do sistema a cada 'intervalo_segundos' (padrão: 5 minutos).
+    Detecta automaticamente quedas de rede entre as verificações do DOU.
+    """
+    global _monitor_ativo
+    _monitor_ativo = True
+    rede_estava_ok = True  # controla mudança de estado da rede
+
+    while _monitor_ativo:
+        time.sleep(intervalo_segundos)
+        if not _monitor_ativo:
+            break
+        try:
+            snapshot = _snapshot_sistema()
+            # Registra queda de rede assim que detectada (transição ok → falha)
+            if rede_estava_ok and not snapshot['rede_ok']:
+                print(f"\n  🔴 REDE CAIU às {snapshot['horario']}!")
+            elif not rede_estava_ok and snapshot['rede_ok']:
+                print(f"\n  🟢 REDE RESTAURADA às {snapshot['horario']}!")
+            rede_estava_ok = snapshot['rede_ok']
+            _logar_snapshot(snapshot)
+        except Exception as e:
+            print(f"\n  ⚠️  Erro no monitoramento periódico: {e}")
+
+
+def _iniciar_monitoramento_periodico(intervalo_segundos: int = 300) -> None:
+    """
+    Inicia a thread de monitoramento periódico em segundo plano.
+    O intervalo padrão é de 5 minutos.
+    """
+    global _thread_monitor
+    _thread_monitor = threading.Thread(
+        target=_thread_monitoramento_periodico,
+        args=(intervalo_segundos,),
+        daemon=True,   # encerra junto com o processo principal
+        name='monitor-sistema'
+    )
+    _thread_monitor.start()
+    print(f"  🔍 Monitoramento periódico iniciado (intervalo: {intervalo_segundos}s)")
+
+
+
 
 _relatorio = {
     'inicio_execucao': None,     # datetime de início do script
@@ -1547,13 +1855,18 @@ def verificar_pessoa(nome: str, config: dict) -> bool:
         return False
 
 
-def _enviar_email_sem_resultado(config: dict, rodada: int, hora_limite: int, minuto_limite: int = 0) -> None:
+def _enviar_email_sem_resultado(config: dict, rodada: int, hora_limite: int, minuto_limite: int = 0,
+                                pessoas: list = None) -> None:
     """
     Envia um e-mail de confirmação para cada pessoa informando que o horário
     limite foi atingido sem novidade.
+    Se 'pessoas' for fornecido, envia apenas para os nomes listados;
+    caso contrário, envia para todas as pessoas da configuração.
     """
     email_cfg = config['email']
-    for nome, cfg_pessoa in config['pessoas'].items():
+    nomes_alvo = pessoas if pessoas is not None else list(config['pessoas'].keys())
+    for nome in nomes_alvo:
+        cfg_pessoa = config['pessoas'][nome]
         url      = cfg_pessoa['url']
         detalhes = (
             f"Horário limite ({hora_limite:02d}:{minuto_limite:02d}) atingido após {rodada} verificação(ões).\n"
@@ -1659,6 +1972,7 @@ def executar_com_agendamento(config: dict) -> None:
     rodada         = 0
     novidade_geral = False
     exec_pos_feita = False  # controla se a execução pós-limite já foi realizada
+    pessoas_pendentes = list(config['pessoas'].keys())  # pessoas que ainda não tiveram novidade
 
     while True:
         agora = datetime.now()
@@ -1675,19 +1989,21 @@ def executar_com_agendamento(config: dict) -> None:
                 print(f"\n{'=' * 80}")
                 print(f"  RODADA {rodada} (EXTRA)  |  {agora.strftime('%d/%m/%Y %H:%M:%S')}")
                 print(f"{'=' * 80}")
-                for nome in config['pessoas']:
+                for nome in list(pessoas_pendentes):
                     encontrou = verificar_pessoa(nome, config)
                     if encontrou:
                         novidade_geral = True
+                        pessoas_pendentes.remove(nome)
                     time.sleep(10)
                 # Após a rodada extra, encerra normalmente
                 print(f"\n  🔔 Rodada extra concluída. Encerrando verificações.")
             else:
                 print(f"\n  🔔 Horário limite ({hora_limite:02d}:{minuto_limite:02d}) atingido. Encerrando verificações.")
 
-            if email_sem_res and not novidade_geral:
+            if email_sem_res and pessoas_pendentes:
                 print("  📧 Enviando e-mail de confirmação (sem novidade no período)...")
-                _enviar_email_sem_resultado(config, rodada, hora_limite, minuto_limite)
+                _enviar_email_sem_resultado(config, rodada, hora_limite, minuto_limite,
+                                            pessoas=pessoas_pendentes)
             break
 
         rodada += 1
@@ -1695,15 +2011,16 @@ def executar_com_agendamento(config: dict) -> None:
         print(f"  RODADA {rodada}  |  {agora.strftime('%d/%m/%Y %H:%M:%S')}")
         print(f"{'=' * 80}")
 
-        # ── Verifica cada pessoa ──────────────────────────────────────────────
+        # ── Verifica cada pessoa pendente ─────────────────────────────────────
         novidade_nesta_rodada = False
         pessoas_com_novidade  = set()
-        for nome in config['pessoas']:
+        for nome in list(pessoas_pendentes):
             encontrou = verificar_pessoa(nome, config)
             if encontrou:
                 novidade_nesta_rodada = True
                 novidade_geral        = True
                 pessoas_com_novidade.add(nome)
+                pessoas_pendentes.remove(nome)  # não verifica mais esta pessoa
             time.sleep(10)
 
         # ── Novidade encontrada → desliga se configurado ──────────────────────
@@ -1722,6 +2039,11 @@ def executar_com_agendamento(config: dict) -> None:
             subprocess.run(['sudo', '/sbin/shutdown', '-h', 'now'], check=True)
             return  # nunca alcançado após o shutdown, mas por clareza
 
+        # ── Se todas as pessoas já tiveram novidade, encerra ──────────────────
+        if not pessoas_pendentes:
+            print(f"\n  ✅ Todas as pessoas já tiveram novidade detectada. Encerrando.")
+            break
+
         # ── Calcula próxima execução ──────────────────────────────────────────
         proxima = datetime.now() + timedelta(minutes=intervalo_min)
         proxima_minutos = proxima.hour * 60 + proxima.minute
@@ -1731,12 +2053,13 @@ def executar_com_agendamento(config: dict) -> None:
         if proxima_minutos >= limite_minutos and not exec_apos_limite:
             print(f"\n  🔔 Próxima verificação seria após o horário limite "
                   f"({hora_limite:02d}:{minuto_limite:02d}). Encerrando.")
-            if email_sem_res and not novidade_geral:
+            if email_sem_res and pessoas_pendentes:
                 print("  📧 Enviando e-mail de confirmação (sem novidade no período)...")
-                _enviar_email_sem_resultado(config, rodada, hora_limite, minuto_limite)
+                _enviar_email_sem_resultado(config, rodada, hora_limite, minuto_limite,
+                                            pessoas=pessoas_pendentes)
             break
 
-        # ── Aguarda até a próxima execução ────────────────────────────────────
+        # ── Aguarda até a próxima execução (verificando o limite a cada 30s) ──
         print(f"\n  ⏳ Próxima verificação: {proxima.strftime('%H:%M:%S')}  "
               f"(em {intervalo_min // 60:02d}:{intervalo_min % 60:02d})")
 
@@ -1745,6 +2068,11 @@ def executar_com_agendamento(config: dict) -> None:
         while True:
             decorrido = time.time() - inicio_espera
             if decorrido >= segundos_espera:
+                break
+            # Interrompe a espera se o horário limite foi atingido
+            agora_espera = datetime.now()
+            if agora_espera.hour * 60 + agora_espera.minute >= limite_minutos:
+                print(f"\r  🔔 Horário limite atingido durante a espera. Encerrando.   ")
                 break
             restante = segundos_espera - decorrido
             print(f"\r  ⏳ Próxima rodada em {int(restante // 60):02d}min {int(restante % 60):02d}s...   ",
@@ -1768,10 +2096,20 @@ def executar_com_agendamento(config: dict) -> None:
 # ============================================================================
 
 if __name__ == "__main__":
+    # Inicia o log em arquivo (DOU_logs/YYYYMMDDHHmm.txt) e redireciona stdout/stderr
+    _iniciar_log()
+
     print("\n" + "=" * 80)
     print("MONITOR DE EDITAIS DOU")
     print(f"Data/Hora: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
     print("=" * 80)
+
+    # Snapshot inicial do sistema (rede, CPU, memória, disco, bateria)
+    print("\n  📊 ESTADO INICIAL DO SISTEMA:")
+    _logar_snapshot(_snapshot_sistema(), prefixo='  📊')
+
+    # Inicia monitoramento periódico em segundo plano (a cada 5 minutos)
+    _iniciar_monitoramento_periodico(intervalo_segundos=300)
 
     # Inicia o rastreador de relatório de execução
     _relatorio_iniciar()
@@ -1796,3 +2134,9 @@ if __name__ == "__main__":
         print(f"\n\n✗ Erro inesperado: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        # Snapshot final antes de encerrar
+        print("\n  📊 ESTADO FINAL DO SISTEMA:")
+        _logar_snapshot(_snapshot_sistema(), prefixo='  📊')
+        # Encerra o log (fecha arquivo, restaura stdout/stderr)
+        _encerrar_log()
