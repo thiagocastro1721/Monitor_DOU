@@ -9,7 +9,7 @@ Melhorias Futuras
 
 [] Trocar o arquivo .json por outro que seja mais fácil de editar manualmente.
 
-[] Adicionar um menu no início do script que permita cadastrar novas pessoas, mesmo que o sistema já tenha sido configurado anteriormente.
+[] Adicionar um menu no início do script que permita cadastrar ou remover pessoas, mesmo que o sistema já tenha sido configurado anteriormente.
 
 [] Aceitar arquivo contendo muitas pessoas a serem adicionadas.
 
@@ -17,4 +17,7 @@ Melhorias Futuras
 
 [RESOLVIDO] As vezes o script gera um falso positivo quando o site do DOU erra e retorna 0 para as variáveis.
 
-[] Corrigir o seguinte BUG. Ao encontrar novidade para uma pessoa o script não continua pesquisando as outras pessoas até dar timeout.
+[RESOLVIDO] Corrigir o seguinte BUG. Ao encontrar novidade para uma pessoa o script não continua pesquisando as outras pessoas até dar timeout.
+
+[] Ao cadastrar uma pessoa perguntar se ela deseja receber um e-mail por dia, mesmo que não haja novidade, ou Receber 
+e-mail somente quando houver novidade no DOU.
